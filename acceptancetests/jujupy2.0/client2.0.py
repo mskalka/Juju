@@ -1,12 +1,19 @@
 from contextlib import contextmanager
 import json
 import logging
+import os
 import subprocess
 import sys
+import yaml
 
 from utility import (
     dump_all_logs,
-    LoggedException
+    get_bootstrap_args,
+    LoggedException,
+    State,
+    GroupReporter,
+    until_timeout,
+    StatusNotMet
 )
 """
 The shit we really care about:
@@ -50,17 +57,24 @@ log = logging.getLogger('jujupy')
 
 
 class NoActiveModel(Exception):
-    """No active Model Selected"""
+    """No active Model Selected."""
 
 
 class JujuCommandError(Exception):
     """Error in called Juju command."""
 
 
+class ControllerNotFound(Exception):
+    """Target controller not found in environemnt."""
+
+
 class TestingContext:
-    """Context handler for testing. Will create a juju client object for use
+    """Context handler for testing. Creates a JujuClient object for use
     in testing then gather all logs and tear down once that test is complete.
 
+
+    with TestingContext.testing_context(args) as test_client:
+        do_some_test(test_client)
 
     Generates a juju environemnt if none exists
         argument flags:
@@ -78,14 +92,12 @@ class TestingContext:
             return a client object pointing to that controller/model
 
     Grabs logs and tears down that environment
-
-
     """
     def __init__(self, args):
         self.environment = args.env
 
     @contextmanager
-    def texting_context(self, args):
+    def testing_context(self, args):
         try:
             client = self.get_client(args)
             yield client
@@ -93,6 +105,8 @@ class TestingContext:
             sys.exit(1)
         finally:
             client.dump_logs()
+            if not args.keep_env:
+                client.cleanup()
 
     def get_client(self, args):
         if args.existing:
@@ -106,7 +120,9 @@ class TestingContext:
         Bootstraps the controller using specified args. Returns a JujuClient
         object pointing to that controller.
         """
-        pass
+        client = JujuClient(args.temp_env_name, args)
+        client.bootstrap(args)
+        return client
 
     def existing_context(self, args):
         """Return a JujuClient object that points to an existing controller.
@@ -116,7 +132,10 @@ class TestingContext:
         for that controller and adds args.temp_env_name model to that
         controller.
         """
-        pass
+        client = JujuClient(args.temp_env_name, args)
+        client._verify_existing_controller(args.existing)
+        client.add_model(args.temp_env_name)
+        return client
 
 
 class JujuClient:
@@ -141,14 +160,19 @@ class JujuClient:
 
     def __init__(self, name, args):
         self.name = name
+        self.substrate = args.env
+        self.region = None
         self.default_model = args.temp_env_name
         self.models = set(self.default_model)
         self.active_model = self._get_active_model()
-        self.keep_env = True
+        if args.existing is not None:
+            self.existing = True
 
-    def juju(self, command, args, get_output=True, controller=False,
+    def juju(self, command, args=None, get_output=True, controller=False,
              model=None, format_json=True):
         """Runs a command against the target or current juju model"""
+        if args is None:
+            args = ()
         if controller:
             args = ('-m', '{}:controller'.format(self.name)) + args
         else:
@@ -199,17 +223,50 @@ class JujuClient:
         """Returns status for the target or active model."""
         self.juju('status', controller=controller, model=model)
 
+    def bootstrap(self, args):
+        """Bootstraps the client object with the given args"""
+        bs_args = get_bootstrap_args(args)
+        subprocess.call(['juju', 'boostrap'].extend(bs_args))
+        reporter = GroupReporter(sys.stdout, 'started')
+        self.wait_for_state(reporter, State.started)
+
     def cleanup(self):
-        """Cleans up the environment by collecting logs and tearing down.
-
-        Collect logs for the default model and any added models
-        Collect controller logs
-
-        If not keep-env:
-            If existing: tear down default model and any added models
-            Else tear down controller
+        """Cleans up the environment by tearing down the models or controller.
         """
-        pass
+        if self.existing:
+            for model in self.models:
+                self.destroy-model(model)
+        else:
+            self.juju('destroy-controller', (self.name, '-y'))
+
+    def wait_for_state(self, reporter, state, timeout=1800,
+                       exc_type=StatusNotMet):
+        """Wait for target state in the client model.
+
+        Take a state object defining the goal state
+        Object checks status/whatever and evaluates state, returning state data
+        until the target state is reached
+        When state is reached, it returns None
+        If timeout is reached before the state returns None, raise.
+
+        """
+        status = None
+        try:
+            for _ in until_timeout(timeout):
+                status = self.status()
+                states = state(status)
+                if states is None:
+                    break
+                else:
+                    reporter.update(states)
+            else:
+                if status is not None:
+                    status.raise_highest_error(
+                        ignore_recoverable=False)
+                raise exc_type(self.env.environment, status)
+        finally:
+            reporter.finish()
+        return status
 
     def _dump_logs(self, model):
         """Contact machines, controller & pull logs
@@ -255,6 +312,24 @@ class JujuClient:
     def _get_model_machines(self, model):
         """Gets the machines from a model"""
         return self.juju('status', model=model)['machines']
+
+    def _verify_existing_controller(target):
+        """Verify the target controller exists in the environment."""
+        home = os.path.expanduser("~")
+        # JUJU DATA
+        if os.environ['JUJU_DATA']:
+            controllers = yaml.loads(open(os.path.join((
+                os.environ['JUJU_DATA'], 'controllers.yaml'))))
+        else:
+            try:
+                controllers = yaml.loads(open(os.path.join(
+                    home, '.local/share/juju/controllers.yaml')))
+            except OSError:
+                controllers = yaml.loads(open(os.path.join(
+                    home, '.juju/controllers.yaml')))
+        if target not in controllers['controllers'].keys():
+            raise ControllerNotFound(
+                '{} not found in local environment.'.format(target))
 
 
 class JujuModel:
